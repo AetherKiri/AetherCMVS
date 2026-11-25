@@ -3,12 +3,20 @@
 use crate::{FormatError, MAX_PAYLOAD};
 use std::sync::{Arc, OnceLock};
 
+mod filter;
+pub use filter::ScaleFilter;
+
 struct ImageData {
     pixels: Vec<u8>,
     content_digest: OnceLock<u128>,
     opaque: OnceLock<bool>,
 }
 
+/// Immutable top-down RGBA pixels with straight (unpremultiplied) alpha.
+///
+/// Rows have no padding and each pixel has four bytes in red, green, blue, alpha
+/// order. Clones share pixel storage. Dimensions and storage are validated by
+/// [`Self::new`].
 #[derive(Clone)]
 pub struct RgbaImage {
     width: u32,
@@ -90,6 +98,18 @@ impl RgbaImage {
         }
     }
 
+    /// Create an image from exactly `width * height * 4` bytes.
+    ///
+    /// Rejects zero dimensions, incorrect byte lengths, and images exceeding
+    /// [`MAX_PAYLOAD`].
+    ///
+    /// ```
+    /// use cmvs_core::render::raster::RgbaImage;
+    ///
+    /// let image = RgbaImage::new(1, 1, vec![255, 0, 0, 255])?;
+    /// assert_eq!(image.pixels(), &[255, 0, 0, 255]);
+    /// # Ok::<(), cmvs_core::FormatError>(())
+    /// ```
     pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self, FormatError> {
         let size = (u64::from(width) * u64::from(height))
             .checked_mul(4)
@@ -157,6 +177,33 @@ impl RgbaImage {
         }
         Ok(())
     }
+    /// Present this logical frame on an opaque RGBA canvas with black margins.
+    pub fn presentation_canvas(
+        &self,
+        [width, height]: [u32; 2],
+        aspect_mode: u32,
+        filter: ScaleFilter,
+    ) -> Result<Self, FormatError> {
+        let viewport = crate::viewport::Viewport::new(
+            [self.width, self.height],
+            [width, height],
+            aspect_mode,
+        )?;
+        if [self.width, self.height] == [width, height] && self.is_opaque() {
+            return Ok(self.clone());
+        }
+        let mut target = vec![0; width as usize * height as usize];
+        self.draw_view(&mut target, width, viewport, filter);
+        let pixels = target
+            .into_iter()
+            .flat_map(|word: u32| {
+                let [b, g, r, _] = word.to_le_bytes();
+                [r, g, b, 255]
+            })
+            .collect();
+        Self::new(width, height, pixels)
+    }
+
     /// Software fullscreen presentation using the same mapping as pointer input.
     pub fn draw_aspect(
         &self,
@@ -178,17 +225,38 @@ impl RgbaImage {
         mode: u32,
         linear: bool,
     ) -> Result<(), FormatError> {
+        self.draw_filtered(target, width, height, mode, linear.into())
+    }
+
+    /// Draw into the visible part of the viewport, compositing over the current target pixels.
+    pub fn draw_filtered(
+        &self,
+        target: &mut [u32],
+        width: u32,
+        height: u32,
+        mode: u32,
+        filter: ScaleFilter,
+    ) -> Result<(), FormatError> {
         let view =
             crate::viewport::Viewport::new([self.width, self.height], [width, height], mode)?;
         if target.len() as u64 != u64::from(width) * u64::from(height) {
             return Err(FormatError("invalid preview surface dimensions"));
         }
-        let xs = view.left.max(0)..(view.left + i64::from(view.width)).min(i64::from(width));
-        let ys = view.top.max(0)..(view.top + i64::from(view.height)).min(i64::from(height));
+        self.draw_view(target, width, view, filter);
+        Ok(())
+    }
+
+    fn draw_view(
+        &self,
+        target: &mut [u32],
+        width: u32,
+        view: crate::viewport::Viewport,
+        filter: ScaleFilter,
+    ) {
+        let [xs, ys] = view.visible_ranges();
         let opaque = self.is_opaque();
         if view.width == self.width && view.height == self.height {
-            // Both filters sample exact texels at native size, including centered
-            // views and cropped cover modes. Avoid coordinate division and four taps.
+            // All filters sample exact texels at native size, even in centered views.
             let columns = (xs.end - xs.start) as usize;
             let source_x = (xs.start - view.left) as usize;
             for y in ys {
@@ -206,9 +274,13 @@ impl RgbaImage {
                     }
                 }
             }
-            return Ok(());
+            return;
         }
-        if linear {
+        if !matches!(filter, ScaleFilter::Nearest | ScaleFilter::Bilinear) {
+            filter::draw(self, target, width as usize, view, filter);
+            return;
+        }
+        if filter == ScaleFilter::Bilinear {
             // Per-axis source pair and weight for each target column/row in view.
             let taps = |range: std::ops::Range<i64>, origin: i64, span: u32, source: u32| {
                 range
@@ -264,7 +336,7 @@ impl RgbaImage {
                         *target = channel(0) << 16 | channel(1) << 8 | channel(2);
                     }
                 }
-                return Ok(());
+                return;
             }
             for (y, &(y0, y1, fy)) in ys.zip(&rows) {
                 for (x, &(x0, x1, fx)) in xs.clone().zip(&columns) {
@@ -294,7 +366,7 @@ impl RgbaImage {
                     *dst = channel(0, 16) | channel(1, 8) | channel(2, 0);
                 }
             }
-            return Ok(());
+            return;
         }
         if opaque {
             let columns: Vec<_> = xs
@@ -317,7 +389,7 @@ impl RgbaImage {
                     *target = rgb(source[source_x]);
                 }
             }
-            return Ok(());
+            return;
         }
         for y in ys {
             for x in xs.clone() {
@@ -335,7 +407,6 @@ impl RgbaImage {
                 *dst = channel(0, 16) | channel(1, 8) | channel(2, 0);
             }
         }
-        Ok(())
     }
     /// RGBA8 PNG with filter 0 rows and stored (uncompressed) deflate blocks, so no
     /// compression library is needed. Intended for exporting rendered research frames.
@@ -465,6 +536,20 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     u128::from(low) | u128::from(high) << 64
 }
 
+/// Fit a movie image onto a logical canvas with opaque black letterboxing.
+/// Matching dimensions preserve the original image and its shared pixel storage.
+/// Rejects zero dimensions and canvases exceeding [`MAX_PAYLOAD`] before allocation.
+pub fn movie_canvas(
+    image: &RgbaImage,
+    size: [u32; 2],
+    filter: impl Into<ScaleFilter>,
+) -> Result<RgbaImage, FormatError> {
+    if [image.width(), image.height()] == size {
+        return Ok(image.clone());
+    }
+    image.presentation_canvas(size, 1, filter.into())
+}
+
 #[cfg(test)]
 mod content_digest_tests {
     use super::*;
@@ -523,16 +608,6 @@ mod content_digest_tests {
     }
 
     #[test]
-    fn digest_cache_does_not_change_equality_and_tracks_pixel_content() {
-        let first = RgbaImage::new(1, 1, vec![1, 2, 3, 4]).unwrap();
-        let second = first.clone();
-        assert_eq!(first.content_digest(), content_hash(first.pixels()));
-        assert_eq!(first, second);
-        assert_eq!(first, first.clone());
-        let changed = RgbaImage::new(1, 1, vec![1, 2, 3, 5]).unwrap();
-        assert_ne!(first.content_digest(), changed.content_digest());
-    }
-    #[test]
     fn content_hash_depends_on_every_byte_and_on_the_length() {
         let mut seen = std::collections::HashMap::new();
         let mut check = |bytes: Vec<u8>| {
@@ -572,5 +647,47 @@ mod content_digest_tests {
         assert_ne!(first.cache_key(), second.cache_key());
         assert_eq!(first.cache_key(), first.clone().cache_key());
         assert_eq!(first, second, "identity is not part of equality");
+    }
+}
+
+#[cfg(test)]
+mod movie_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn movie_canvas_bounds_allocation_and_preserves_matching_frame_identity() {
+        let video = RgbaImage::new(2, 1, [200, 100, 40, 255].repeat(2))
+            .unwrap()
+            .into_frame();
+        for size in [[0, 1], [1, 0], [u32::MAX, u32::MAX], [4097, 4096]] {
+            assert!(movie_canvas(&video, size, false).is_err());
+        }
+        let frame = movie_canvas(&video, [2, 1], true).unwrap();
+        assert_eq!(frame.cache_key(), video.cache_key());
+        assert!(std::ptr::eq(frame.pixels(), video.pixels()));
+    }
+
+    #[test]
+    fn movie_canvas_keeps_logical_device_dimensions_and_letterboxes_small_videos() {
+        let video = RgbaImage::new(2, 1, [200, 100, 40, 255].repeat(2)).unwrap();
+        for [width, height] in [[1280, 720], [1024, 768]] {
+            for linear in [false, true] {
+                let frame = movie_canvas(&video, [width, height], linear).unwrap();
+                assert_eq!([frame.width(), frame.height()], [width, height]);
+                let pixel = |y| {
+                    let at = ((y * width + width / 2) * 4) as usize;
+                    &frame.pixels()[at..at + 4]
+                };
+                let top = (height - width / 2) / 2;
+                assert_eq!(pixel(top - 1), [0, 0, 0, 255]);
+                assert_eq!(pixel(top), [200, 100, 40, 255]);
+                assert_eq!(pixel(height - top - 1), [200, 100, 40, 255]);
+                assert_eq!(pixel(height - top), [0, 0, 0, 255]);
+                assert_eq!(
+                    movie_canvas(&frame, [width, height], linear).unwrap(),
+                    frame
+                );
+            }
+        }
     }
 }

@@ -1,35 +1,49 @@
 use super::*;
+use cmvs_core::render::viewport::Viewport;
 
 struct ScaleGroup {
-    source: Weak<Texture>,
+    image: Weak<Texture>,
+    original: Weak<Texture>,
     binding: wgpu::BindGroup,
 }
 
-/// One scaling pass per submission. Queue writes precede that submission, just as
+/// Scaling parameters are shared by the passes in one submission. Queue writes precede it, just as
 /// for scene uniforms; later changes cannot affect earlier submitted frames.
 pub(super) struct Scaling {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
+    intermediate_pipeline: wgpu::RenderPipeline,
+    intermediate: Option<Shared<Texture>>,
     buffer: wgpu::Buffer,
-    data: Option<[u8; 32]>,
+    data: Option<[u8; 48]>,
     groups: Vec<ScaleGroup>,
 }
+
+struct ScaleOptions {
+    view: Viewport,
+    filter: ScaleFilter,
+    preview: bool,
+}
+
 impl Scaling {
     pub(super) fn prune(&mut self) {
-        self.groups.retain(|group| group.source.strong_count() != 0);
+        self.groups
+            .retain(|group| group.image.strong_count() != 0 && group.original.strong_count() != 0);
     }
 
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let (layout, pipeline) = scaling_pipeline(device, format);
+        let (layout, pipeline, intermediate_pipeline) = scaling_pipelines(device, format);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scaling parameters"),
-            size: 32,
+            size: 48,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         Self {
             layout,
             pipeline,
+            intermediate_pipeline,
+            intermediate: None,
             buffer,
             data: None,
             groups: Vec::new(),
@@ -39,26 +53,17 @@ impl Scaling {
     fn bind(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        source: &Shared<Texture>,
-        data: [f32; 8],
+        image: &Shared<Texture>,
+        original: &Shared<Texture>,
     ) -> wgpu::BindGroup {
-        let mut bytes = [0u8; 32];
-        for (out, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(data) {
-            *out = value.to_le_bytes();
-        }
-        if self.data != Some(bytes) {
-            queue.write_buffer(&self.buffer, 0, &bytes);
-            self.data = Some(bytes);
-        }
         // Weak owners do not pin a recyclable texture. Stale bindings disappear
         // after its pool/cache releases it, even though the GPU view is a handle.
         self.prune();
+        let image_owner = Shared::downgrade(image);
+        let original_owner = Shared::downgrade(original);
         if let Some(at) = self.groups.iter().position(|group| {
-            group
-                .source
-                .upgrade()
-                .is_some_and(|owner| Shared::ptr_eq(&owner, source))
+            Weak::ptr_eq(&group.image, &image_owner)
+                && Weak::ptr_eq(&group.original, &original_owner)
         }) {
             let group = self.groups.remove(at);
             let binding = group.binding.clone();
@@ -75,7 +80,11 @@ impl Scaling {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&source.view),
+                    resource: wgpu::BindingResource::TextureView(&image.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&original.view),
                 },
             ],
         });
@@ -83,11 +92,131 @@ impl Scaling {
             self.groups.remove(0);
         }
         self.groups.push(ScaleGroup {
-            source: Shared::downgrade(source),
+            image: image_owner,
+            original: original_owner,
             binding: binding.clone(),
         });
         binding
     }
+
+    fn draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &Shared<Texture>,
+        target: &wgpu::TextureView,
+        options: ScaleOptions,
+    ) {
+        let ScaleOptions {
+            view,
+            filter,
+            preview,
+        } = options;
+        let [width, height] = source.size();
+        // Shader filter selectors are independent of the game's numbered modes.
+        // Keep these in sync with the constants in present.wgsl.
+        let (shader_filter, anti_ringing) = match filter {
+            ScaleFilter::Nearest => (0, false),
+            ScaleFilter::Bilinear => (1, false),
+            ScaleFilter::Keys => (2, false),
+            ScaleFilter::Lanczos4 => (3, false),
+            ScaleFilter::Mitchell => (4, false),
+            ScaleFilter::Lanczos3 { anti_ringing } => (5, anti_ringing),
+        };
+        let mut data = [
+            view.left as i32,
+            view.top as i32,
+            view.width as i32,
+            view.height as i32,
+            width as i32,
+            height as i32,
+            shader_filter,
+            i32::from(preview),
+            0,
+            0,
+            0,
+            i32::from(anti_ringing),
+        ];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut intermediate = None;
+        if !matches!(filter, ScaleFilter::Nearest | ScaleFilter::Bilinear)
+            && [width, height] != [view.width, view.height]
+        {
+            let [xs, ys] = view.visible_ranges();
+            let visible_width = (xs.end - xs.start) as u32;
+            let visible_height = (ys.end - ys.start) as u32;
+            // Choose the smaller intermediate, with the cropped margins omitted.
+            let vertical_first = u64::from(visible_width) * u64::from(height)
+                > u64::from(width) * u64::from(visible_height);
+            let size = if vertical_first {
+                [width, visible_height]
+            } else {
+                [visible_width, height]
+            };
+            data[8] = xs.start as i32;
+            data[9] = ys.start as i32;
+            data[10] = i32::from(vertical_first);
+            if self
+                .intermediate
+                .as_ref()
+                .is_none_or(|image| image.size() != size)
+            {
+                // Keep signed intermediate weights until both passes are complete.
+                self.intermediate = Some(Texture::with_format(
+                    device,
+                    size,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    wgpu::TextureFormat::Rgba16Float,
+                ));
+            }
+            let binding = self.bind(device, source, source);
+            let image = self.intermediate.as_ref().expect("intermediate texture");
+            encode_scale(
+                &mut encoder,
+                &image.view,
+                &self.intermediate_pipeline,
+                &binding,
+            );
+            intermediate = Some(Shared::clone(image));
+        }
+        let mut bytes = [0u8; 48];
+        for (out, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(data) {
+            *out = value.to_le_bytes();
+        }
+        if self.data != Some(bytes) {
+            queue.write_buffer(&self.buffer, 0, &bytes);
+            self.data = Some(bytes);
+        }
+        let image = intermediate.as_ref().unwrap_or(source);
+        let original = if anti_ringing { source } else { image };
+        let binding = self.bind(device, image, original);
+        encode_scale(&mut encoder, target, &self.pipeline, &binding);
+        queue.submit([encoder.finish()]);
+    }
+}
+
+fn encode_scale(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    group: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("frame scaling"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 /// Window presentation is separate from the logical CMVS canvas.
@@ -129,8 +258,8 @@ impl Presenter {
         renderer: &Renderer,
         frame: &GpuFrame,
         size: [u32; 2],
-        mode: u32,
-        linear: bool,
+        aspect_mode: u32,
+        filter: impl Into<ScaleFilter>,
         preview: bool,
     ) -> Result<bool> {
         renderer.check()?;
@@ -171,54 +300,46 @@ impl Presenter {
                 return Err("GPU surface validation failed".into());
             }
         };
-        let viewport = cmvs_core::viewport::Viewport::new(frame.size, size, mode)?;
-        let data = [
-            viewport.left as f32,
-            viewport.top as f32,
-            viewport.width as f32,
-            viewport.height as f32,
-            frame.size[0] as f32,
-            frame.size[1] as f32,
-            u32::from(linear) as f32,
-            u32::from(preview) as f32,
-        ];
-        let group = self
-            .scaling
-            .bind(&renderer.device, &renderer.queue, &frame.target, data);
+        let view = Viewport::new(frame.size, size, aspect_mode)?;
         let target = output.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format),
             ..Default::default()
         });
-        let mut encoder = renderer.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("window present"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.scaling.pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        renderer.queue.submit([encoder.finish()]);
+        self.scaling.draw(
+            &renderer.device,
+            &renderer.queue,
+            &frame.target,
+            &target,
+            ScaleOptions {
+                view,
+                filter: filter.into(),
+                preview,
+            },
+        );
         renderer.queue.present(output);
         renderer.check()?;
         Ok(true)
     }
 }
 
-fn scaling_pipeline(
+fn scaling_pipelines(
     device: &wgpu::Device,
     view_format: wgpu::TextureFormat,
-) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
+    let texture = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[
@@ -232,16 +353,8 @@ fn scaling_pipeline(
                 },
                 count: None,
             },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
+            texture(1),
+            texture(2),
         ],
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -253,43 +366,49 @@ fn scaling_pipeline(
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: Default::default(),
-        depth_stencil: None,
-        multisample: Default::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: view_format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
+    let pipeline = |entry, format| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
 
-    (layout, pipeline)
+    (
+        layout,
+        pipeline("fs", view_format),
+        pipeline("fs_intermediate", wgpu::TextureFormat::Rgba16Float),
+    )
 }
 
 pub(crate) fn scale_image(
     renderer: &mut Renderer,
     image: &RgbaImage,
     size: [u32; 2],
-    linear: bool,
+    filter: ScaleFilter,
 ) -> Result<GpuFrame> {
     renderer.check()?;
-    let viewport = cmvs_core::viewport::Viewport::new([image.width(), image.height()], size, 1)?;
+    let view = Viewport::new([image.width(), image.height()], size, 1)?;
     if size
         .iter()
         .any(|&v| v > renderer.device.limits().max_texture_dimension_2d)
@@ -298,41 +417,21 @@ pub(crate) fn scale_image(
     }
     renderer.bindings.clear();
     let source = renderer.texture(image)?;
-    let data = [
-        viewport.left as f32,
-        viewport.top as f32,
-        viewport.width as f32,
-        viewport.height as f32,
-        image.width() as f32,
-        image.height() as f32,
-        u32::from(linear) as f32,
-        0.0,
-    ];
     let target = renderer.canvases.acquire(&renderer.device, size);
     let scaling = renderer
         .scaling
         .get_or_insert_with(|| Scaling::new(&renderer.device, wgpu::TextureFormat::Rgba8Unorm));
-    let group = scaling.bind(&renderer.device, &renderer.queue, &source, data);
-    let mut encoder = renderer.device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("movie scale"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&scaling.pipeline);
-        pass.set_bind_group(0, &group, &[]);
-        pass.draw(0..3, 0..1);
-    }
-    renderer.queue.submit([encoder.finish()]);
+    scaling.draw(
+        &renderer.device,
+        &renderer.queue,
+        &source,
+        &target.view,
+        ScaleOptions {
+            view,
+            filter,
+            preview: false,
+        },
+    );
     renderer.check()?;
     Ok(GpuFrame {
         target,
@@ -345,6 +444,96 @@ pub(crate) fn scale_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a native GPU adapter; run explicitly"]
+    fn high_quality_scaling_matches_cpu_with_transparency_and_cropping() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
+        let (mut gpu, _) = Renderer::new(&instance, None).unwrap();
+        let image = RgbaImage::new(
+            11,
+            7,
+            (0..77)
+                .flat_map(|n| [n * 37, n * 53, n * 13, n % 7 * 42].map(|v| v as u8))
+                .collect(),
+        )
+        .unwrap();
+        let source = gpu.preview_image(&image).unwrap();
+        let mut scaling = Scaling::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut frames = Vec::new();
+        // Exercise both pass orders, exact sample centers, single-axis resizing,
+        // letterbox, crop, and centered identity scaling.
+        for (size, mode) in [
+            ([22, 5], 3),
+            ([5, 17], 3),
+            ([33, 21], 3),
+            ([11, 21], 3),
+            ([13, 14], 2),
+            ([12, 19], 1),
+            ([14, 10], 0),
+        ] {
+            let view = Viewport::new(source.size, size, mode).unwrap();
+            for filter in [
+                ScaleFilter::Keys,
+                ScaleFilter::Lanczos4,
+                ScaleFilter::Mitchell,
+                ScaleFilter::Lanczos3 {
+                    anti_ringing: false,
+                },
+                ScaleFilter::Lanczos3 { anti_ringing: true },
+            ] {
+                let target = gpu.canvases.acquire(&gpu.device, size);
+                scaling.draw(
+                    &gpu.device,
+                    &gpu.queue,
+                    &source.target,
+                    &target.view,
+                    ScaleOptions {
+                        view,
+                        filter,
+                        preview: false,
+                    },
+                );
+                frames.push((
+                    GpuFrame {
+                        target,
+                        device: gpu.device.clone(),
+                        queue: gpu.queue.clone(),
+                        size,
+                    },
+                    &image,
+                    mode,
+                    filter,
+                ));
+            }
+        }
+        // Reuse the intermediate with a different original before reading either result.
+        let solid = RgbaImage::new(11, 7, [240, 25, 100, 255].repeat(77)).unwrap();
+        let filter = ScaleFilter::Lanczos3 { anti_ringing: true };
+        for source in [&image, &solid, &image] {
+            let frame = gpu.render_image(source, [33, 21], filter).unwrap();
+            frames.push((frame, source, 1, filter));
+        }
+        for (frame, image, mode, filter) in frames {
+            let [width, height] = frame.size;
+            let mut expected = vec![0; (width * height) as usize];
+            image
+                .draw_filtered(&mut expected, width, height, mode, filter)
+                .unwrap();
+            let actual = frame.read().unwrap();
+            for (word, pixel) in expected.iter().zip(actual.pixels().as_chunks::<4>().0) {
+                for (c, shift) in [16, 8, 0].into_iter().enumerate() {
+                    assert!(
+                        pixel[c].abs_diff((word >> shift) as u8) <= 1,
+                        "{filter:?}, {width}x{height}, aspect {mode}: {word:06x} != {pixel:?}"
+                    );
+                }
+                assert_eq!(pixel[3], 255);
+            }
+        }
+        gpu.check().unwrap();
+    }
 
     #[test]
     #[ignore = "requires a native GPU adapter; run explicitly"]

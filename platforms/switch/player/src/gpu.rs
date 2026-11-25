@@ -2,19 +2,16 @@
 //! [`cmvs_console::gpu::Compositor`]; movie scaling, presentation and readback are the
 //! Switch's own. Readback happens only when the engine requests a device frame.
 use crate::{SCREEN, sys::SwitchGpu};
-use cmvs_console::gpu::Compositor;
+use cmvs_console::{backend::ConsoleGpu, gpu::Compositor};
 use cmvs_core::{
-    raster::RgbaImage,
-    scene_render::{
-        Blend, Layer, RenderFrame,
-        shader::{BASE_FLOATS, shader_draw},
-    },
-    viewport::Viewport,
+    render::raster::RgbaImage, render::scene_render::Blend, render::scene_render::Layer,
+    render::scene_render::RenderFrame, render::scene_render::shader::BASE_FLOATS,
+    render::scene_render::shader::shader_draw, render::viewport::Viewport,
 };
 use cmvs_native::GpuDevice;
 use std::error::Error;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 /// Retained texture bytes, as in cmvs-wgpu; not a bound on total GPU memory.
 const CACHE_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -31,6 +28,12 @@ impl GpuRenderer {
     }
 
     pub fn render(&mut self, frame: &RenderFrame<'_>) -> Result<()> {
+        // deko3d limits 2D textures to 16384 texels per side.
+        if frame.cvns_source_exceeds(16384) {
+            return self
+                .0
+                .render(&RenderFrame::from_precomposited(frame.render_cpu()?));
+        }
         self.0.render(frame)
     }
 
@@ -76,6 +79,18 @@ impl GpuRenderer {
         self.0.device().read(size, &mut pixels)?;
         Ok(RgbaImage::new(size[0], size[1], pixels)?)
     }
+
+    /// The displayed texture was already scaled by the host.
+    pub fn forget_presented(&mut self) {
+        self.0.forget_presented();
+    }
+}
+
+impl ConsoleGpu for GpuRenderer {
+    fn read_presented(&mut self) -> Option<Result<RgbaImage>> {
+        self.0.presented()?;
+        Some(self.read())
+    }
 }
 
 fn view_params(view: Viewport, source: [u32; 2], linear: bool) -> [f32; 8] {
@@ -101,6 +116,7 @@ fn cursor_overlays(at: [f64; 2]) -> Vec<[f32; BASE_FLOATS]> {
                     rect,
                     color: [255; 3],
                     alpha: 255,
+                    screen_mask: None,
                     blend: Blend::Replace,
                 },
                 SCREEN,
