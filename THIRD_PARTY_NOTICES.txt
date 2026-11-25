@@ -73,6 +73,10 @@ These crates are used through their public APIs. Exact transitive versions and
 checksums are recorded in Cargo.lock; native-audio binary distributions must
 retain the applicable notices for the dependencies they include.
 
+Android save locking uses nix 0.32.0 under the MIT License.
+Copyright (c) 2015 Carl Lerche + nix-rust Authors.
+https://github.com/nix-rust/nix
+
 OpenType preview dependency (used through its public Rust API):
   ab_glyph 0.2.32, Apache-2.0
   https://github.com/alexheretic/ab-glyph

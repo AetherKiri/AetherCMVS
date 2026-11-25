@@ -7,6 +7,21 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "android")]
+#[test]
+fn game_savedata_lock_survives_closing_an_independent_descriptor() {
+    let root = Root::new();
+    let profile = ProfileSystemSave::open_game_savedata(&root.game()).unwrap();
+    let other = fs::File::open(profile.directory().join(".cmvs-system.lock")).unwrap();
+    drop(other);
+    let error = ProfileSystemSave::open_game_savedata(&root.game())
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    drop(profile);
+    assert!(ProfileSystemSave::open_game_savedata(&root.game()).is_ok());
+}
+
 #[test]
 fn configuration_uses_the_profile_lock_atomic_replacement_and_own_backup() {
     use cmvs_rs::settings::Configuration;

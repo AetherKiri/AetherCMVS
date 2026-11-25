@@ -10,6 +10,35 @@ use std::{
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "android")]
+fn lock_android_profile(file: &File) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::{fcntl, libc};
+    use rustix::fs::{FlockOperation, flock};
+
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => return Ok(()),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Emulated shared storage can reject flock but support whole-file OFD locks.
+    // Both locks belong to this open file description and are released on close.
+    let lock = libc::flock {
+        l_type: libc::F_WRLCK as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    match fcntl::fcntl(file, fcntl::FcntlArg::F_OFD_SETLK(&lock)) {
+        Ok(_) => Ok(()),
+        // fcntl permits either EAGAIN or EACCES for a conflicting lock. The
+        // host treats PermissionDenied as read-only media and switches profiles.
+        Err(Errno::EACCES | Errno::EAGAIN) => Err(io::ErrorKind::WouldBlock.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn regular_file(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
@@ -128,11 +157,8 @@ impl ProfileSystemSave {
         if lock.metadata()?.len() != 0 {
             return Err(io::Error::other("profile lock file must be empty"));
         }
-        // std::fs::File locking is unsupported on Android. Use the same
-        // nonblocking OS flock there, retaining the descriptor until drop.
         #[cfg(target_os = "android")]
-        let locked = rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-            .map_err(io::Error::from);
+        let locked = lock_android_profile(&lock);
         // The browser adapter already returns io::Error rather than std's
         // TryLockError; keep its worker-local lock result unchanged.
         #[cfg(target_arch = "wasm32")]
