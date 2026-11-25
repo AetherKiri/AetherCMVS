@@ -3,8 +3,7 @@
 //! index is retained; large graphics archives are read on demand through bounded seeks.
 use crate::{
     FormatError, MAX_PAYLOAD,
-    filesystem::{self as fs, File},
-    platform::resolve_under,
+    filesystem::{File, HostFs, resolve_under_with_fs},
 };
 use std::{
     collections::BTreeMap,
@@ -13,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     offset: u64,
@@ -39,24 +38,19 @@ pub fn basename(name: &[u8]) -> Result<String> {
     }
     Ok(last.to_ascii_lowercase())
 }
-fn present(root: &Path, name: &[u8]) -> Result<Option<PathBuf>> {
-    match resolve_under(root, name) {
+fn present(fs: &dyn HostFs, root: &Path, name: &[u8]) -> Result<Option<PathBuf>> {
+    match resolve_under_with_fs(fs, root, name) {
         Ok(path) => Ok(Some(path)),
-        Err(e)
-            if e.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 impl Archive {
-    pub fn open_optional(root: &Path, name: &[u8]) -> Result<Option<Self>> {
-        let Some(path) = present(root, name)? else {
+    pub fn open_optional(fs: &dyn HostFs, root: &Path, name: &[u8]) -> Result<Option<Self>> {
+        let Some(path) = present(fs, root, name)? else {
             return Ok(None);
         };
-        let mut file = File::open(path)?;
+        let mut file = fs.open_read(&path)?;
         let entries = read_index(&mut file)?;
         Ok(Some(Self { file, entries }))
     }
@@ -148,14 +142,14 @@ impl Images {
             archives: None,
         }
     }
-    pub fn read(&mut self, name: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn read(&mut self, fs: &dyn HostFs, name: &[u8]) -> Result<Option<Vec<u8>>> {
         if !name.is_ascii() {
             return Ok(None);
         }
         if self.archives.is_none() {
             let mut archives = Vec::new();
             for name in [b"Pk/Graphic.pk".as_slice(), b"Pk/Mosic.pk"] {
-                if let Some(archive) = Archive::open_optional(&self.root, name)? {
+                if let Some(archive) = Archive::open_optional(fs, &self.root, name)? {
                     archives.push(archive);
                 }
             }
@@ -181,24 +175,17 @@ impl Images {
 }
 /// The script overlay is the explicit opt-in signal for this GBK patch family.
 /// A stock game, including one with independent movie replacements, remains Shift-JIS.
-pub fn text_encoding(root: &Path) -> Result<crate::text_encoding::TextEncoding> {
-    use crate::text_encoding::TextEncoding;
-    Ok(
-        if present(root, b"Pk/Scripts.pk")?.is_some_and(fs::is_file) {
-            TextEncoding::Gbk
-        } else {
-            TextEncoding::ShiftJis
-        },
-    )
+pub fn has_script_overlay(fs: &dyn HostFs, root: &Path) -> Result<bool> {
+    Ok(present(fs, root, b"Pk/Scripts.pk")?.is_some_and(|path| fs.is_file(&path)))
 }
 
 /// Return the actual relative file so indexing, frame seeks and the audio decoder
 /// all refer to the same replacement container (their byte offsets must agree).
-pub(crate) fn movie_name(root: &Path, original: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn movie_name(fs: &dyn HostFs, root: &Path, original: &[u8]) -> Result<Vec<u8>> {
     if original.is_ascii() {
         let name = basename(original)?;
         let replacement = format!("Pk/{name}").into_bytes();
-        if present(root, &replacement)?.is_some() {
+        if present(fs, root, &replacement)?.is_some() {
             return Ok(replacement);
         }
     }

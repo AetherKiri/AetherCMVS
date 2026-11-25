@@ -233,7 +233,7 @@ impl DeviceView {
             return Err("degenerate device view basis");
         }
         // PerspectiveFovLH uses near=0.1, far=100; queue 5 tests LESS with no Z writes.
-        if !(0.1..100.0).contains(&z) {
+        if z < 0.1 || z >= 100.0 {
             return Ok(None);
         }
         let [width, height] = viewport.map(|v| v as f32);
@@ -309,7 +309,7 @@ impl CameraHost {
     /// - 0x2272 / 0x43d160: system result = moving; pops nothing.
     /// - 0x2273 / 0x43d190: SP-4 mode, SP-8..SP-16 XYZ, SP-20 duration; pops 20.
     /// - 0x2274 / 0x43d200: SP-4 mode, SP-8/SP-12 X/Y angles, SP-16 duration; pops 16.
-    pub(super) fn view_motion(&mut self, call: &mut Call<'_, '_>) -> Result<(), DecodeError> {
+    pub(super) fn view_motion(&mut self, call: &mut Call<'_>) -> Result<(), DecodeError> {
         let command = call.command;
         match command {
             0x270 => {
@@ -363,7 +363,7 @@ impl CameraHost {
     /// cmvs-20070119 0x2271 / 0x43d0a0: wait on the view motion with the gates of 0x2069.
     pub(crate) fn handle_wait_view(
         &mut self,
-        call: &mut Call<'_, '_>,
+        call: &mut Call<'_>,
         gate: SkipGate,
         input: &mut ActionInput,
     ) -> Result<Flow, DecodeError> {
@@ -398,7 +398,7 @@ impl CameraHost {
         Ok(flow)
     }
 
-    pub(super) fn set_view(&mut self, call: &mut Call<'_, '_>) -> Result<(), DecodeError> {
+    pub(super) fn set_view(&mut self, call: &mut Call<'_>) -> Result<(), DecodeError> {
         let command = call.command;
         let count = if command == 0x260 { 3 } else { 1 };
         let mut values = [0; 3];

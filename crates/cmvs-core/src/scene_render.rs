@@ -1,6 +1,11 @@
-//! Software presentation of verified static 2D objects, their children, full-screen color
-//! fades, mask transitions and camera projections and strip wipes. Unsupported transforms,
-//! blend modes and unverified solid-color paths fail explicitly.
+//! Scene draw-queue preparation and software rendering.
+//!
+//! Use [`render_scene`] to produce an RGBA frame, or [`prepare_scene`] to obtain a
+//! [`RenderFrame`] for a GPU backend. Both paths share object ordering and layer
+//! preparation. Pass host-generated glyph and window objects as additional objects.
+//!
+//! Invalid dimensions and unsupported transforms or effect combinations return
+//! [`FormatError`] during queue preparation.
 use crate::{
     FormatError, MAX_PAYLOAD,
     camera::CameraHost,
@@ -8,8 +13,10 @@ use crate::{
     scene::{DrawState, MaskTransition, ObjectImage, SceneHost, SceneObject},
 };
 
+pub mod cvns;
 pub mod shader;
 
+#[derive(Clone, Copy)]
 pub enum Layer<'a> {
     /// World-space inverse-view billboard: full texture, wrapped linear sampling,
     /// alpha blending and no depth writes (original queue 5).
@@ -40,7 +47,7 @@ pub enum Layer<'a> {
         alpha: u32,
         blend: Blend,
     },
-    /// A logically scaled image with the original texture-space transition mask.
+    /// A projected or logically scaled image with a texture-space transition mask.
     ProjectedMasked {
         image: &'a ObjectImage,
         rect: [i64; 4],
@@ -57,14 +64,17 @@ pub enum Layer<'a> {
         rect: [f32; 4],
         corners: [[f32; 2]; 4],
         alpha: u32,
+        mask: Option<&'a MaskTransition>,
         blend: Blend,
     },
     Solid {
         rect: [i64; 4],
         color: [u8; 3],
         alpha: u32,
+        screen_mask: Option<&'a ObjectImage>,
         blend: Blend,
     },
+    Cvns(cvns::Draw<'a>),
     Fade(&'a crate::fade::Fade),
 }
 
@@ -100,7 +110,7 @@ impl Blend {
 
 /// The verified textured paths supply white diffuse RGB (0x1400238a0). Stage 0
 /// COLORARG1=TEXTURE, COLORARG2=DIFFUSE, so SUBTRACT saturates RGB to black while
-/// leaving the independent alpha operation intact. Solid primitives use no texture.
+/// leaving the independent alpha operation intact. Solid primitives have no primary texture.
 fn texture_operation(mut layer: Layer<'_>, enabled: bool) -> Layer<'_> {
     if enabled {
         match &mut layer {
@@ -110,7 +120,9 @@ fn texture_operation(mut layer: Layer<'_>, enabled: bool) -> Layer<'_> {
                 blend, mask: None, ..
             }
             | Layer::Projected { blend, .. }
-            | Layer::Rotated { blend, .. } => *blend = blend.subtract_white(),
+            | Layer::Rotated {
+                blend, mask: None, ..
+            } => *blend = blend.subtract_white(),
             _ => {}
         }
     }
@@ -203,6 +215,23 @@ fn order(words: &[u32; 22]) -> f32 {
     words[10] as i32 as f32
 }
 
+/// The transition samples the second texture at the source image's texel coordinates.
+fn check_mask_rect(
+    image: &ObjectImage,
+    rect: [i64; 4],
+    mask: &MaskTransition,
+) -> Result<(), FormatError> {
+    let [w, h] = [image.pixels.width(), image.pixels.height()];
+    if rect != [0, 0, i64::from(w), i64::from(h)]
+        || [mask.mask.pixels.width(), mask.mask.pixels.height()] != [w, h]
+    {
+        return Err(FormatError(
+            "mask transition on a cropped or differently sized image is not verified",
+        ));
+    }
+    Ok(())
+}
+
 /// Builds an image layer, or None when the object draws nothing (empty rect, zero alpha).
 fn image_layer<'a>(
     image: &'a ObjectImage,
@@ -217,16 +246,8 @@ fn image_layer<'a>(
     if w <= 0 || h <= 0 || alpha <= 0 {
         return Ok(None);
     }
-    let size = [image.pixels.width(), image.pixels.height()].map(i64::from);
-    // The mask is the object's second texture; only the case where it covers the whole,
-    // equally sized image texel for texel is modeled.
     if let Some(mask) = mask {
-        let mask_size = [mask.mask.pixels.width(), mask.mask.pixels.height()].map(i64::from);
-        if [sx, sy, w, h] != [0, 0, size[0], size[1]] || mask_size != size {
-            return Err(FormatError(
-                "mask transition on a cropped or differently sized image is not verified",
-            ));
-        }
+        check_mask_rect(image, [sx, sy, w, h], mask)?;
     }
     let scale = [words[18], words[19]].map(f32::from_bits);
     // 0x140022500 divides the signed hundredths by 100.0f; only a zero angle skips rotation.
@@ -249,6 +270,7 @@ fn image_layer<'a>(
             rect: [sx, sy, w, h].map(|v| v as f32),
             corners,
             alpha: alpha.min(255) as u32,
+            mask: None,
             blend: blend(words, image, alpha, false)?,
         }));
     }
@@ -419,6 +441,7 @@ fn solid_layer<'a>(
         },
         color: [r, g, b],
         alpha: alpha.min(255) as u32,
+        screen_mask: None,
         blend: if alpha >= 255 {
             Blend::Replace
         } else if words[1] == 2 {
@@ -498,7 +521,7 @@ fn logical_screen_scale(
     object: &SceneObject,
     parent_scale: Option<f32>,
 ) -> Result<f32, FormatError> {
-    if !scene.allow_logical_screen_scale {
+    if !scene.config.allow_logical_screen_scale {
         return match object.logical_size[0] {
             0 => Ok(1.0),
             width if width == scene.screen_size()[0] => Ok(1.0),
@@ -536,13 +559,12 @@ fn require_unit_projection_scale(factor: f32) -> Result<(), FormatError> {
 /// source rectangle around the origin (0x140024020) and places it at the projected position
 /// and scale (0x1400238a0, device factor 1 on the 1280x720 viewport) minus the device's
 /// half-pixel offset. The object's own angle rotates its local corners before projection
-/// scaling. Inherited attached children reuse the parent projection and origin; masks,
-/// effect targets are not verified. Parent rotation is enabled only for the inspected
-/// HAROUSE build. Camera roll follows
+/// scaling. Inherited attached children reuse the parent projection and origin.
+/// Parent rotation is enabled only for the inspected HAROUSE build. Camera roll follows
 /// KUNADO 0x140061130/0x140036200; +52 also shifts projection horizontally, while
 /// +48 and the copied +52 angle are unused by that vertex transform.
 fn projected_layer<'a>(
-    scene: &SceneHost,
+    scene: &'a SceneHost,
     cameras: Option<&CameraHost>,
     slot: Option<u8>,
     object: &'a SceneObject,
@@ -571,11 +593,6 @@ fn projected_layer<'a>(
         return Ok(None);
     }
     check(words, true)?;
-    if slot.is_some_and(|slot| scene.mask_on(slot).is_some()) {
-        return Err(FormatError(
-            "mask transition on a projected object is not verified",
-        ));
-    }
     if words[0] == 3 && !camera.enabled() {
         return Ok(None);
     }
@@ -640,6 +657,17 @@ fn projected_layer<'a>(
     if scale.iter().any(|v| *v <= 0.0) {
         return Ok(None);
     }
+    let mask = slot.and_then(|slot| scene.mask_on(slot));
+    if let Some(mask) = mask {
+        check_mask_rect(image, [sx, sy, w, h], mask)?;
+    }
+    let blend = blend(words, image, i64::from(alpha), mask.is_some())?;
+    let blend = if mask.is_none() && draw.texture_subtract != 0 {
+        blend.subtract_white()
+    } else {
+        blend
+    };
+    let alpha = alpha.min(255) as u32;
     let offset = [0, 1].map(|i| {
         if let Some(p) = inherited {
             // 0x140020708/0x14002070c: signed 16-bit parent origin minus child position.
@@ -654,7 +682,7 @@ fn projected_layer<'a>(
     // then subtracts the offset, applies the projection scale, rotates by its +52 argument
     // (the parent's angle for an inherited child, 0 otherwise) and adds the position.
     let parent_angle = inherited.map_or(0, |p| p[20] as i32);
-    if parent_angle != 0 && !scene.allow_projected_parent_rotation {
+    if parent_angle != 0 && !scene.config.allow_projected_parent_rotation {
         return Err(FormatError(
             "children of a rotated projected parent are not verified",
         ));
@@ -703,19 +731,14 @@ fn projected_layer<'a>(
         if !corners.as_flattened().iter().all(|v| v.is_finite()) {
             return Err(FormatError("projected object has a non-finite extent"));
         }
-        let blend = blend(words, image, i64::from(alpha), false)?;
-        let blend = if draw.texture_subtract != 0 {
-            blend.subtract_white()
-        } else {
-            blend
-        };
         return Ok(Some((
             key,
             Layer::Rotated {
                 image,
                 rect: [sx, sy, w, h].map(|v| v as f32),
                 corners,
-                alpha: alpha.min(255) as u32,
+                alpha,
+                mask,
                 blend,
             },
         )));
@@ -729,22 +752,26 @@ fn projected_layer<'a>(
     if quad.iter().any(|v| !v.is_finite()) {
         return Err(FormatError("projected object has a non-finite extent"));
     }
-    let blend = blend(words, image, i64::from(alpha), false)?;
-    let blend = if draw.texture_subtract != 0 {
-        blend.subtract_white()
+    let rect = [sx, sy, w, h];
+    let layer = if let Some(mask) = mask {
+        Layer::ProjectedMasked {
+            image,
+            rect,
+            quad,
+            alpha,
+            mask,
+            blend,
+        }
     } else {
-        blend
-    };
-    Ok(Some((
-        key,
         Layer::Projected {
             image,
-            rect: [sx, sy, w, h],
+            rect,
             quad,
-            alpha: alpha.min(255) as u32,
+            alpha,
             blend,
-        },
-    )))
+        }
+    };
+    Ok(Some((key, layer)))
 }
 
 /// Moves an image layer by a quake offset.
@@ -806,6 +833,7 @@ fn shifted(layer: Layer<'_>, by: [i64; 2]) -> Layer<'_> {
             rect,
             corners,
             alpha,
+            mask,
             blend,
         } => {
             let [x, y] = by.map(|v| v as f32);
@@ -814,6 +842,7 @@ fn shifted(layer: Layer<'_>, by: [i64; 2]) -> Layer<'_> {
                 rect,
                 corners: corners.map(|[cx, cy]| [cx + x, cy + y]),
                 alpha,
+                mask,
                 blend,
             }
         }
@@ -821,11 +850,13 @@ fn shifted(layer: Layer<'_>, by: [i64; 2]) -> Layer<'_> {
             rect: [x, y, w, h],
             color,
             alpha,
+            screen_mask,
             blend,
         } => Layer::Solid {
             rect: [x + by[0], y + by[1], w, h],
             color,
             alpha,
+            screen_mask,
             blend,
         },
         fade => fade,
@@ -843,8 +874,19 @@ pub struct RenderFrame<'a> {
     height: u32,
     clear: [u8; 4],
     commands: Vec<DrawCommand<'a>>,
+    precomposited: Option<RgbaImage>,
 }
 impl<'a> RenderFrame<'a> {
+    pub fn from_precomposited(image: RgbaImage) -> Self {
+        Self {
+            width: image.width(),
+            height: image.height(),
+            clear: [0, 0, 0, 255],
+            commands: Vec::new(),
+            precomposited: Some(image),
+        }
+    }
+
     pub fn dimensions(&self) -> [u32; 2] {
         [self.width, self.height]
     }
@@ -854,9 +896,25 @@ impl<'a> RenderFrame<'a> {
     pub fn commands(&self) -> &[DrawCommand<'a>] {
         &self.commands
     }
+    pub fn precomposited(&self) -> Option<&RgbaImage> {
+        self.precomposited.as_ref()
+    }
+
+    /// A CVNS draw uploads its entire source, even when only one texel is visible.
+    pub fn cvns_source_exceeds(&self, max_dimension: u32) -> bool {
+        self.commands.iter().any(|layer| match layer {
+            Layer::Cvns(draw) => draw.texture().is_some_and(|(image, _)| {
+                image.width() > max_dimension || image.height() > max_dimension
+            }),
+            _ => false,
+        })
+    }
 
     /// Executes the shared command queue with the portable rasterizer.
-    pub fn render_cpu(self) -> Result<RgbaImage, FormatError> {
+    pub fn render_cpu(&self) -> Result<RgbaImage, FormatError> {
+        if let Some(image) = &self.precomposited {
+            return Ok(image.clone());
+        }
         let size = (u64::from(self.width) * u64::from(self.height))
             .checked_mul(4)
             .ok_or(FormatError("scene surface size overflow"))?;
@@ -867,7 +925,7 @@ impl<'a> RenderFrame<'a> {
         for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&self.clear);
         }
-        for command in self.commands {
+        for &command in &self.commands {
             draw(&mut pixels, self.width, self.height, command);
         }
         RgbaImage::new(self.width, self.height, pixels)
@@ -880,7 +938,7 @@ pub fn render(scene: &SceneHost, width: u32, height: u32) -> Result<RgbaImage, F
     render_scene(scene, None, &[], width, height)
 }
 
-/// `render` with additional objects; see `render_scene`.
+/// Render a scene with extra objects and no camera state; see [`render_scene`].
 pub fn render_with_objects(
     scene: &SceneHost,
     additional: &[&SceneObject],
@@ -890,10 +948,13 @@ pub fn render_with_objects(
     render_scene(scene, None, additional, width, height)
 }
 
-/// Additional objects (e.g. a backend's glyph images and message windows) join the
-/// same stable layer queue before the fade. Their order breaks ties after slot objects.
-/// 0x140015fc0 draws camera 0/1's queues 2/6 before queue 3, which holds the 2D
-/// objects, windows, glyphs and the fade, so projected objects lie beneath all of them.
+/// Render a scene, optional cameras, and host-supplied objects to an RGBA frame.
+///
+/// `width` and `height` are logical output pixels. `additional` objects, such as
+/// message windows and glyph images, join the stable layer queue before the fade;
+/// their input order breaks ties after ordinary slot objects. Projected objects
+/// require camera state. Invalid dimensions or unsupported draw state return errors.
+// 0x140015fc0 draws camera 0/1's queues 2/6 before the 2D queue 3.
 pub fn render_scene(
     scene: &SceneHost,
     cameras: Option<&CameraHost>,
@@ -917,6 +978,38 @@ pub fn prepare_scene<'a>(
         .ok_or(FormatError("scene surface size overflow"))?;
     if width == 0 || height == 0 || size > MAX_PAYLOAD as u64 {
         return Err(FormatError("invalid scene surface dimensions"));
+    }
+    if let Some(movie) = &scene.modal_movie {
+        let mut commands = vec![Layer::Image {
+            image: movie,
+            rect: [0, 0, width.into(), height.into()],
+            corner: [0, 0],
+            alpha: 255,
+            mask: None,
+            screen_mask: None,
+            blend: Blend::Replace,
+        }];
+        append_modal(&mut commands, scene, width, height);
+        return Ok(RenderFrame {
+            width,
+            height,
+            clear: [0, 0, 0, 255],
+            commands,
+            precomposited: None,
+        });
+    }
+    if let Some(cvns) = scene.cvns() {
+        let mut frame = cvns::prepare(
+            cvns,
+            scene.clear_enabled(),
+            scene.clear().color,
+            scene.layer_fade_alpha(),
+            additional,
+            width,
+            height,
+        );
+        append_modal(&mut frame.commands, scene, width, height);
+        return cvns::prepare_gpu(frame);
     }
     // Validate the entire scene before rasterizing. Slot order is the stable tie-breaker.
     let mut entries = Vec::new();
@@ -1129,7 +1222,7 @@ pub fn prepare_scene<'a>(
             }
             _ => {}
         }
-        check_screen(d, scene.allow_screen_coordinates_one)?;
+        check_screen(d, scene.config.allow_screen_coordinates_one)?;
         let position = [d[8] as i32, d[9] as i32].map(i64::from);
         let mask = slot.and_then(|slot| scene.mask_on(slot));
         let layer = match object
@@ -1180,7 +1273,7 @@ pub fn prepare_scene<'a>(
                     continue;
                 }
                 let child_scale = logical_screen_scale(scene, child, Some(screen_scale))?;
-                check_screen(words, scene.allow_screen_coordinates_one)?;
+                check_screen(words, scene.config.allow_screen_coordinates_one)?;
                 let Some(layer) = child_layer(object, d, child, words, child_scale)? else {
                     continue;
                 };
@@ -1231,6 +1324,7 @@ pub fn prepare_scene<'a>(
                     rect: [left, top, w, h],
                     color: [r, g, b],
                     alpha: u32::from(a),
+                    screen_mask: None,
                     blend: Blend::Alpha,
                 }),
                 children: Vec::new(),
@@ -1256,6 +1350,7 @@ pub fn prepare_scene<'a>(
                 ],
                 color: [r, g, b],
                 alpha: fade.opacity.clamp(0, 255) as u32,
+                screen_mask: None,
                 blend: Blend::Alpha,
             }
         };
@@ -1401,12 +1496,38 @@ pub fn prepare_scene<'a>(
             commands.push(layer);
         }
     }
+    append_modal(&mut commands, scene, width, height);
     Ok(RenderFrame {
         width,
         height,
         clear: scene.clear().rgba(),
         commands,
+        precomposited: None,
     })
+}
+
+fn append_modal<'a>(commands: &mut Vec<Layer<'a>>, scene: &'a SceneHost, width: u32, height: u32) {
+    if let Some(([x, y, w, h], image)) = &scene.modal_panel {
+        commands.push(Layer::Solid {
+            rect: [0, 0, i64::from(width), i64::from(height)],
+            color: [8, 11, 18],
+            alpha: 144,
+            screen_mask: None,
+            blend: Blend::Alpha,
+        });
+        commands.push(Layer::Projected {
+            image,
+            rect: [
+                0,
+                0,
+                i64::from(image.pixels.width()),
+                i64::from(image.pixels.height()),
+            ],
+            quad: [*x, *y, x + w, y + h].map(|v| v as f32 - 0.5),
+            alpha: 255,
+            blend: Blend::Replace,
+        });
+    }
 }
 
 /// One target pixel under the device blend state, with straight 8-bit source values.
@@ -1427,6 +1548,16 @@ fn put(target: &mut [u8], source: [u8; 3], alpha: u32, blend: Blend) {
             Blend::Additive | Blend::BlackAdditive => (t + (s * alpha + 127) / 255).min(255) as u8,
         };
     }
+}
+
+fn transition_alpha(mask: &MaskTransition, [tx, ty]: [f32; 2], alpha: u32) -> u32 {
+    // Like the shared GPU shader, point-sample the mask at floor(source UV).
+    let mw = i64::from(mask.mask.pixels.width());
+    let mh = i64::from(mask.mask.pixels.height());
+    let mx = ((tx + 0.5).floor() as i64).clamp(0, mw - 1);
+    let my = ((ty + 0.5).floor() as i64).clamp(0, mh - 1);
+    let green = mask.mask.pixels.pixels()[((my * mw + mx) * 4 + 1) as usize];
+    (alpha as f32 * mask.coverage(green)).round() as u32
 }
 
 /// Bilinear sampling (cmvs.cfg TEXTURE_MIN/MAG_FILTER = 1 selects D3DTEXF_LINEAR in
@@ -1459,16 +1590,8 @@ fn draw_projected<const WRAP: bool>(
         for x in x0..x1 {
             let tx = sx as f32 + (x as f32 - left) * step[0] - 0.5;
             let texel = bilinear_address::<WRAP>(image, tx, ty);
-            let mut alpha = (u32::from(texel[3]) * opacity + 127) / 255;
-            if let Some(mask) = mask {
-                // The shared mask shader uses point sampling at floor(source UV).
-                let mw = i64::from(mask.mask.pixels.width());
-                let mh = i64::from(mask.mask.pixels.height());
-                let mx = ((tx + 0.5).floor() as i64).clamp(0, mw - 1);
-                let my = ((ty + 0.5).floor() as i64).clamp(0, mh - 1);
-                let green = mask.mask.pixels.pixels()[((my * mw + mx) * 4 + 1) as usize];
-                alpha = (alpha as f32 * mask.coverage(green)).round() as u32;
-            }
+            let alpha = (u32::from(texel[3]) * opacity + 127) / 255;
+            let alpha = mask.map_or(alpha, |mask| transition_alpha(mask, [tx, ty], alpha));
             let dst = ((y * i64::from(width) + x) * 4) as usize;
             put(
                 &mut pixels[dst..dst + 3],
@@ -1518,7 +1641,7 @@ fn draw_rotated(
     [sx, sy, w, h]: [f32; 4],
     corners: [[f32; 2]; 4],
     opacity: u32,
-    blend: Blend,
+    (blend, mask): (Blend, Option<&MaskTransition>),
 ) {
     let [u0, v0, u1, v1] = [sx, sy, sx + w, sy + h].map(f64::from);
     let texture = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
@@ -1570,6 +1693,7 @@ fn draw_rotated(
                 });
                 let texel = bilinear(image, tx, ty);
                 let alpha = (u32::from(texel[3]) * opacity + 127) / 255;
+                let alpha = mask.map_or(alpha, |mask| transition_alpha(mask, [tx, ty], alpha));
                 let dst = ((y * i64::from(width) + x) * 4) as usize;
                 put(
                     &mut pixels[dst..dst + 3],
@@ -1666,6 +1790,7 @@ fn tessellate_world_quad<'a>(
             rect: [x0, y0, x1 - x0, y1 - y0],
             corners: screen,
             alpha: quad.alpha,
+            mask: None,
             blend: quad.blend,
         });
     }
@@ -1674,6 +1799,7 @@ fn tessellate_world_quad<'a>(
 
 /// 0x140020340 mode 4 maps the second texture over the device viewport.
 /// 0x140030a70 copies its green channel into texture alpha; RGB stays primary.
+/// REALIVE 0x14004e3e0 inherits this texture independently of the primary image.
 fn screen_mask<'a>(
     mut layer: Layer<'a>,
     object: &'a SceneObject,
@@ -1685,13 +1811,7 @@ fn screen_mask<'a>(
         .or(object.draw.as_ref());
     let texture = object.secondary_image.as_ref().or_else(|| {
         inherited
-            .filter(|_| {
-                object
-                    .draw
-                    .as_ref()
-                    .is_some_and(|d| d.words[14] & 0xff000000 == 0)
-                    && draw.is_some_and(|d| d.texture_mode == 4)
-            })
+            .filter(|_| draw.is_some_and(|d| d.texture_mode == 4))
             .and_then(|p| p.secondary_image.as_ref())
     });
     if let Some(texture) = texture {
@@ -1701,10 +1821,13 @@ fn screen_mask<'a>(
         match &mut layer {
             Layer::Image {
                 screen_mask,
-                mask,
+                mask: None,
                 blend,
                 ..
-            } if mask.is_none() => {
+            }
+            | Layer::Solid {
+                screen_mask, blend, ..
+            } => {
                 *screen_mask = Some(texture);
                 *blend = blend.alpha();
             }
@@ -1718,8 +1841,23 @@ fn screen_mask<'a>(
     Ok(layer)
 }
 
+fn screen_mask_alpha(
+    texture: &ObjectImage,
+    [width, height]: [u32; 2],
+    [x, y]: [i64; 2],
+    alpha: u32,
+) -> u32 {
+    let tx = x as f32 * texture.pixels.width() as f32 / width as f32 - 0.5;
+    let ty = y as f32 * texture.pixels.height() as f32 / height as f32 - 0.5;
+    (alpha * u32::from(bilinear(texture, tx, ty)[1]) + 127) / 255
+}
+
 fn draw(pixels: &mut [u8], width: u32, height: u32, layer: Layer<'_>) {
     let (image, [sx, sy, w, h], [left, top], opacity, mask, screen_mask, blend) = match layer {
+        Layer::Cvns(draw) => {
+            draw.render(pixels, width);
+            return;
+        }
         Layer::Billboard { image, quad, alpha } => {
             draw_projected::<true>(
                 pixels,
@@ -1788,19 +1926,32 @@ fn draw(pixels: &mut [u8], width: u32, height: u32, layer: Layer<'_>) {
             rect,
             corners,
             alpha,
+            mask,
             blend,
         } => {
-            draw_rotated(pixels, [width, height], image, rect, corners, alpha, blend);
+            draw_rotated(
+                pixels,
+                [width, height],
+                image,
+                rect,
+                corners,
+                alpha,
+                (blend, mask),
+            );
             return;
         }
         Layer::Solid {
             rect: [left, top, w, h],
             color,
             alpha,
+            screen_mask,
             blend,
         } => {
             for y in top.max(0)..(top + h).min(i64::from(height)) {
                 for x in left.max(0)..(left + w).min(i64::from(width)) {
+                    let alpha = screen_mask.map_or(alpha, |texture| {
+                        screen_mask_alpha(texture, [width, height], [x, y], alpha)
+                    });
                     let dst = ((y * i64::from(width) + x) * 4) as usize;
                     put(&mut pixels[dst..dst + 3], color, alpha, blend);
                 }
@@ -1888,9 +2039,7 @@ fn draw(pixels: &mut [u8], width: u32, height: u32, layer: Layer<'_>) {
                 alpha = (alpha as f32 * coverage[usize::from(texture[src + 1])]).round() as u32;
             }
             if let Some(texture) = screen_mask {
-                let tx = x as f32 * texture.pixels.width() as f32 / width as f32 - 0.5;
-                let ty = y as f32 * texture.pixels.height() as f32 / height as f32 - 0.5;
-                alpha = (alpha * u32::from(bilinear(texture, tx, ty)[1]) + 127) / 255;
+                alpha = screen_mask_alpha(texture, [width, height], [x, y], alpha);
             }
             put(&mut pixels[dst..dst + 3], [p[0], p[1], p[2]], alpha, blend);
         }
@@ -1934,6 +2083,7 @@ mod scale_tests {
             height: 64,
             clear: [0, 0, 0, 255],
             commands: layers,
+            precomposited: None,
         };
         assert!(
             frame
@@ -2000,6 +2150,7 @@ mod scale_tests {
             height: 64,
             clear: [0, 0, 0, 255],
             commands: layers,
+            precomposited: None,
         };
         let pixels = frame.render_cpu().unwrap();
         assert_eq!(
@@ -2043,6 +2194,7 @@ mod scale_tests {
             height: 64,
             clear: [0, 0, 0, 255],
             commands: layers,
+            precomposited: None,
         };
         let pixels = frame.render_cpu().unwrap();
         let green = pixels
@@ -2743,6 +2895,24 @@ mod scale_tests {
 #[cfg(test)]
 mod prepared_frame_tests {
     use super::*;
+
+    #[test]
+    fn cvns_translucent_layers_truncate_each_write() {
+        use crate::scene::cvns::{CvnsSprite, CvnsSpriteKind};
+
+        let mut scene = SceneHost::default();
+        let sprites = &mut scene.cvns_mut().sprites;
+        let solid = |color, alpha| CvnsSprite {
+            kind: CvnsSpriteKind::SolidRect { color },
+            src_rect: [0, 0, 1, 1],
+            alpha,
+            ..CvnsSprite::default()
+        };
+        sprites[64] = Some(solid(0x646464, 256));
+        sprites[..64].fill(Some(solid(0, 1)));
+        let frame = prepare_scene(&scene, None, &[], 1, 1).unwrap();
+        assert_eq!(frame.precomposited().unwrap().pixels(), [36, 36, 36, 255]);
+    }
 
     #[test]
     fn prepared_queue_preserves_equal_layer_order_and_pixel_result() {
