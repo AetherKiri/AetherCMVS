@@ -11,119 +11,14 @@ use std::{
     },
 };
 
+// Keep the public Android filesystem name for existing embedders. The core
+// StdFs owns the platform-specific locking policy for all file descriptors.
 #[cfg(target_os = "android")]
-mod android_fs {
-    use cmvs_core::{
-        host::filesystem::File, host::filesystem::HostFile, host::filesystem::HostFs,
-        host::filesystem::Metadata, host::filesystem::OpenOptions, host::filesystem::StdFs,
-        host::filesystem::metadata_from_std,
-    };
-    use std::{
-        io::{self, Read, Seek, SeekFrom, Write},
-        path::{Path, PathBuf},
-    };
+pub use cmvs_core::host::filesystem::StdFs as AndroidHostFs;
 
-    struct AndroidFile(std::fs::File);
-
-    impl Read for AndroidFile {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-
-    impl Write for AndroidFile {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
-    }
-
-    impl Seek for AndroidFile {
-        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-            self.0.seek(pos)
-        }
-    }
-
-    impl HostFile for AndroidFile {
-        fn metadata(&self) -> io::Result<Metadata> {
-            Ok(metadata_from_std(&self.0.metadata()?))
-        }
-        fn sync_all(&self) -> io::Result<()> {
-            self.0.sync_all()
-        }
-        fn try_lock(&self) -> io::Result<()> {
-            rustix::fs::flock(
-                &self.0,
-                rustix::fs::FlockOperation::NonBlockingLockExclusive,
-            )
-            .map_err(io::Error::from)
-        }
-    }
-
-    /// Android filesystem adapter using non-blocking OS `flock` for save-directory locks.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct AndroidHostFs;
-
-    impl HostFs for AndroidHostFs {
-        fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<File> {
-            Ok(File::from_host(Box::new(AndroidFile(
-                StdFs::open_std_file(path, options)?,
-            ))))
-        }
-        fn metadata(&self, path: &Path) -> io::Result<Metadata> {
-            StdFs.metadata(path)
-        }
-        fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
-            StdFs.symlink_metadata(path)
-        }
-        fn try_exists(&self, path: &Path) -> io::Result<bool> {
-            StdFs.try_exists(path)
-        }
-        fn is_file(&self, path: &Path) -> bool {
-            StdFs.is_file(path)
-        }
-        fn is_dir(&self, path: &Path) -> bool {
-            StdFs.is_dir(path)
-        }
-        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-            StdFs.canonicalize(path)
-        }
-        fn absolute(&self, path: &Path) -> io::Result<PathBuf> {
-            StdFs.absolute(path)
-        }
-        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-            StdFs.create_dir_all(path)
-        }
-        fn remove_file(&self, path: &Path) -> io::Result<()> {
-            StdFs.remove_file(path)
-        }
-        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            StdFs.rename(from, to)
-        }
-        fn session_id(&self) -> u32 {
-            StdFs.session_id()
-        }
-        fn read_dir_names(&self, dir: &Path) -> io::Result<Option<Vec<std::ffi::OsString>>> {
-            StdFs.read_dir_names(dir)
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-pub use android_fs::AndroidHostFs;
-
-/// Default standard-library [`HostFs`] for this OS (`AndroidHostFs` on Android, `StdFs` elsewhere).
+/// Filesystem used by embedded sessions and their game-local saves.
 pub fn default_host_fs() -> Arc<dyn HostFs> {
-    #[cfg(target_os = "android")]
-    {
-        Arc::new(AndroidHostFs)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        cmvs_core::host::filesystem::default_fs()
-    }
+    cmvs_core::host::filesystem::default_fs()
 }
 
 const IMPORTED: &str = ".cmvs-legacy-imported";
@@ -312,6 +207,19 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn embedded_game_savedata_uses_shared_storage_locks() {
+        let root = Fixture::new();
+        let first = game_savedata(&root.game(), &root.legacy()).unwrap();
+        let independent = fs::File::open(root.savedata().join(".cmvs-system.lock")).unwrap();
+        drop(independent);
+        let conflict = game_savedata(&root.game(), &root.legacy()).err().unwrap();
+        assert_eq!(conflict.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
+        assert!(game_savedata(&root.game(), &root.legacy()).is_ok());
     }
 
     #[test]
