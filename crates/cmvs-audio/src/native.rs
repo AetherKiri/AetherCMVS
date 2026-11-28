@@ -11,7 +11,7 @@ use cmvs_core::{
     host::resources::ResourceSource,
 };
 #[cfg(feature = "native")]
-use rodio::{DeviceSinkBuilder, MixerDeviceSink};
+use rodio::{CpalErrorKind, DeviceSinkBuilder, MixerDeviceSink};
 use rodio::{
     Player, Source,
     mixer::{Mixer, MixerSource},
@@ -292,7 +292,10 @@ impl NativeAudio {
         let copy = fault.clone();
         let mut stream = DeviceSinkBuilder::from_default_device()?
             .with_error_callback(move |e| {
-                *copy.lock().unwrap() = Some(e.to_string());
+                // CPAL has already rerouted the active stream for this notification.
+                if e.kind() != CpalErrorKind::DeviceChanged {
+                    *copy.lock().unwrap() = Some(e.to_string());
+                }
             })
             .open_sink_or_fallback()?;
         stream.log_on_drop(false);
